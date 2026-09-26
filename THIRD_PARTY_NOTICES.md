@@ -18,6 +18,6 @@ The packaged app includes Python and Tcl/Tk and is built with PyInstaller. These
 - Tcl/Tk: Tcl/Tk licenses, <https://www.tcl-lang.org/software/tcltk/license.html>.
 - PyInstaller bootloader: GPL with a bootloader exception, <https://pyinstaller.org/en/stable/license.html>.
 
-The build collects the installed components' license files into `THIRD_PARTY_LICENSES.txt` inside the distributable ZIP. This file is generated for the actual build environment. PyInstaller's build dependencies are development tools, not application imports.
+The build collects the installed components' license files into `THIRD_PARTY_LICENSES.txt` in both the installer and portable ZIP. This file is generated for the actual build environment. PyInstaller's build dependencies are development tools, not application imports. The installer is created with [Inno Setup](https://jrsoftware.org/isinfo.php), whose [license](https://jrsoftware.org/files/is/license.txt) permits distributing generated installations.
 
 The Tcl 8.6 notice is also preserved in `third_party/Tcl-LICENSE.txt`, obtained from the [Tcl project's 8.6 source branch](https://github.com/tcltk/tcl/blob/core-8-6-branch/license.terms). The Windows build currently targets Python installations with Tcl/Tk 8.6.

@@ -29,6 +29,9 @@ class App(tk.Tk):
         # instead of letting Windows font scaling overrun the fixed initial window.
         self.tk.call("tk", "scaling", 4 / 3)
         self.title("Snap Extract")
+        icon = Path(__file__).resolve().parent / "assets/app.ico"
+        if self.tk.call("tk", "windowingsystem") == "win32" and icon.is_file():
+            self.iconbitmap(default=str(icon))
         self.geometry("1180x840")
         self.minsize(960, 740)
         self.configure(bg=BG)
@@ -59,6 +62,9 @@ class App(tk.Tk):
         self.columns = {c: tk.BooleanVar(value=c == "name" or c in selected) for c in ALL_COLUMNS}
         self.deck_request = tk.StringVar(value=str(settings.get("deck_request", "")))
         self.export_dir = str(settings.get("export_dir", Path.home() / "Documents/Snap Extract"))
+        self.deck_format = settings.get("deck_format", "Text")
+        if self.deck_format not in ("Text", "CSV", "TSV", "JSON"):
+            self.deck_format = "Text"
         self.status = tk.StringVar(value="Loading your collection…")
         self.catalog_status = tk.StringVar(value="Reading cached card data…")
         self.summary = tk.StringVar(value="Your collection, ready for the next deck.")
@@ -126,6 +132,8 @@ class App(tk.Tk):
         self.browse_button.pack(side="left", padx=8)
         self.load_button = ttk.Button(line, text="Load collection", command=self.load)
         self.load_button.pack(side="left")
+        self.decks_button = ttk.Button(line, text="Saved decks…", command=self.open_decks)
+        self.decks_button.pack(side="left", padx=(8, 0))
 
         # Reserve the action area before allocating remaining space to the table.
         footer = ttk.Frame(outer)
@@ -243,6 +251,12 @@ class App(tk.Tk):
         state = "normal" if self.output and not self.busy else "disabled"
         self.copy_button.configure(state=state)
         self.save_button.configure(state=state)
+        self.decks_button.configure(state="normal" if self.collection is not None and not self.busy else "disabled")
+
+    def open_decks(self):
+        if self.collection is not None and not self.busy:
+            from .deck_gui import DeckExportDialog
+            return DeckExportDialog(self)
 
     def _path_changed(self, *_):
         self.output = ""
@@ -301,6 +315,8 @@ class App(tk.Tk):
                     warnings.append(f"{len(self.collection.missing)} cards have UNKNOWN stats. Refresh card data.")
                 if self.collection.ignored:
                     warnings.append(f"Skipped {self.collection.ignored} malformed entries without a card ID.")
+                if self.collection.deck_warnings:
+                    warnings.append("Some saved decks could not be read. Open Saved decks for details.")
                 self.status.set(" ".join(warnings) or "Ready. Filters apply to both preview and export. Collection last saved " + self.collection.modified[:16].replace("T", " ") + ".")
                 self.persist()
             else:
@@ -319,11 +335,15 @@ class App(tk.Tk):
             "TSV": "Tab-separated columns for pasting directly into a spreadsheet.",
             "JSON": "Structured data for scripts and other tools."}[self.format.get()])
         self.save_button.configure(text=f"Save {'prompt' if self.format.get() == 'AI prompt' else self.format.get()}…")
-        self.rows = filter_rows(self.collection.rows, self.query.get(), self.cost.get(), self.sort.get()) if self.collection else []
-        self.tree.delete(*self.tree.get_children())
-        for index, row in enumerate(self.rows):
-            self.tree.insert("", "end", iid=str(index), values=tuple(row[c] if row[c] is not None else "?" for c in DEFAULT_COLUMNS), tags=("alternate",) if index % 2 else ())
-        self.detail.set("Select a card to read its full ability.")
+        rows = filter_rows(self.collection.rows, self.query.get(), self.cost.get(), self.sort.get()) if self.collection else []
+        # Format/column/prompt changes do not change the visible cards. Keep the
+        # selection and scroll position instead of rebuilding hundreds of items.
+        if rows != self.rows:
+            self.rows = rows
+            self.tree.delete(*self.tree.get_children())
+            for index, row in enumerate(self.rows):
+                self.tree.insert("", "end", iid=str(index), values=tuple(row[c] if row[c] is not None else "?" for c in DEFAULT_COLUMNS), tags=("alternate",) if index % 2 else ())
+            self.detail.set("Select a card to read its full ability.")
         if self.collection:
             self.summary.set(f"{len(self.rows)} of {len(self.collection.rows)} cards in export  ·  {self.collection.duplicates} duplicate copies removed")
         columns = [c for c, variable in self.columns.items() if variable.get()]
@@ -372,7 +392,8 @@ class App(tk.Tk):
     def persist(self):
         settings = {"collection_path": self.path.get(), "format": self.format.get(),
                     "columns": [c for c, v in self.columns.items() if v.get()],
-                    "deck_request": self.deck_request.get(), "export_dir": self.export_dir}
+                    "deck_request": self.deck_request.get(), "export_dir": self.export_dir,
+                    "deck_format": self.deck_format}
         try:
             atomic_write(self.settings_path, json.dumps(settings, indent=2))
         except OSError:

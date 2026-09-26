@@ -30,3 +30,7 @@ settings.json
 *.tsv
 *.exe
 *.zip
+*.whl
+*.tar.gz
+*.pfx
+*.p12

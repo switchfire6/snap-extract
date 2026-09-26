@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from snap_extract.core import (extract_collection, filter_rows, parse_catalog, read_json,
-                               refresh_catalog, render_export, save_export, validate_catalog)
+from snap_extract.core import (CatalogRedirectHandler, atomic_write, extract_collection, filter_rows,
+                               parse_catalog, read_json, refresh_catalog, render_export, save_export, validate_catalog)
+from urllib.request import Request
 
 
 CARD = {"card_id": "A", "name": 'A, the "Great"', "cost": 0, "power": -1,
@@ -97,10 +98,37 @@ class CoreTests(unittest.TestCase):
         cache = self.root / "catalog.json"
         cache.write_text("previous cache", encoding="utf-8")
         response = io.BytesIO(b"<html>Service unavailable</html>")
-        with patch("snap_extract.core.urllib.request.urlopen", return_value=response):
+        with patch("snap_extract.core.urllib.request.OpenerDirector.open", return_value=response):
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 refresh_catalog(cache)
         self.assertEqual(cache.read_text(), "previous cache")
+
+    def test_redirects_cannot_downgrade_https_or_leave_catalog_origin(self):
+        handler = CatalogRedirectHandler()
+        request = Request("https://snap.fan/cards/")
+        for url in ("http://snap.fan/cards/", "https://example.com/", "https://snap.fan.evil.test/",
+                    "https://snap.fan:444/cards/", "https://user:password@snap.fan/cards/"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                handler.redirect_request(request, None, 302, "Found", {}, url)
+        result = handler.redirect_request(request, None, 302, "Found", {}, "https://snap.fan/cards/?page=1")
+        self.assertEqual(result.full_url, "https://snap.fan/cards/?page=1")
+
+    def test_oversized_catalog_preserves_cache(self):
+        cache = self.root / "catalog.json"
+        cache.write_text("previous cache", encoding="utf-8")
+        with patch("snap_extract.core.urllib.request.OpenerDirector.open", return_value=io.BytesIO(b"x" * 8_000_001)):
+            with self.assertRaisesRegex(ValueError, "large"):
+                refresh_catalog(cache)
+        self.assertEqual(cache.read_text(), "previous cache")
+
+    def test_cache_rejects_malformed_optional_fields(self):
+        payload = {"schema": 1, "fetched_at": "2026-09-06T12:00:00+00:00",
+                   "cards": {str(i): dict(CARD, card_id=str(i)) for i in range(100)}}
+        for field in ("series", "keywords", "card_type"):
+            with self.subTest(field=field):
+                malformed = dict(payload, cards=dict(payload["cards"], bad=dict(CARD, card_id="bad", **{field: {}})))
+                with self.assertRaisesRegex(ValueError, "Invalid card data"):
+                    validate_catalog(malformed)
 
     def test_csv_round_trip_quotes_commas_newlines_and_negative_power(self):
         card = dict(CARD, ability='Line one, "quoted"\nLine two')
@@ -118,6 +146,22 @@ class CoreTests(unittest.TestCase):
         result = json.loads(render_export([dict(CARD, cost=None)], format="JSON"))[0]
         self.assertIsNone(result["cost"])
         self.assertEqual(result["power"], -1)
+
+    def test_spreadsheet_control_characters_and_fullwidth_formulas(self):
+        for name in ("\ttext", "\rtext", "\ntext", "  =1+1", "＝1+1", "＋1+1", "－1+1", "＠SUM(1)"):
+            for format_name, delimiter in (("CSV", ","), ("TSV", "\t")):
+                with self.subTest(name=name, format=format_name):
+                    data = render_export([dict(CARD, name=name)], format=format_name)
+                    row = next(csv.DictReader(io.StringIO(data, newline=""), delimiter=delimiter))
+                    self.assertEqual(row["name"], "'" + name)
+                    self.assertEqual(row["power"], "-1")
+
+    def test_embedded_carriage_return_cannot_create_an_unquoted_record(self):
+        name = "Alpha\r=1+1"
+        data = render_export([dict(CARD, name=name)])
+        rows = list(csv.DictReader(io.StringIO(data, newline="")))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], name)
 
     def test_filter_high_cost_unknown_and_zero_power(self):
         rows = [CARD, dict(CARD, name="Big", cost=8, power=0), dict(CARD, name="Missing", cost=None, power=None)]
@@ -143,6 +187,21 @@ class CoreTests(unittest.TestCase):
         output = self.root / "exports/cards.csv"
         save_export(output, render_export([CARD]), "CSV", self.source)
         self.assertTrue(output.read_bytes().startswith(b"\xef\xbb\xbf"))
+
+    def test_default_game_state_protected_even_when_reading_a_copy(self):
+        game_file = self.root / "game/CollectionState.json"
+        with patch("snap_extract.core.default_collection_path", return_value=game_file):
+            with self.assertRaisesRegex(ValueError, "outside"):
+                save_export(game_file.parent / "other.json", "oops", "JSON", self.source)
+        self.assertFalse(game_file.parent.exists())
+
+    def test_exclusive_atomic_write_does_not_replace_existing_file(self):
+        output = self.root / "result.txt"
+        atomic_write(output, "first", overwrite=False)
+        with self.assertRaises(FileExistsError):
+            atomic_write(output, "second", overwrite=False)
+        self.assertEqual(output.read_text(), "first")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["result.txt", "state"])
 
     def test_empty_export_and_invalid_columns_rejected(self):
         for rows, columns in [([], ["name"]), ([CARD], []), ([CARD], ["account_id"]),

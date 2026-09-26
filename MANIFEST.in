@@ -1,0 +1,8 @@
+include CHANGELOG.md CONTRIBUTING.md SECURITY.md THIRD_PARTY_NOTICES.md
+include build.ps1 requirements-build.txt requirements-dev.txt run_app.py
+include *.cmd *.vbs
+recursive-include assets *.png
+recursive-include installer *.iss
+recursive-include third_party *.txt
+recursive-include tools *.py *.ps1
+recursive-include tests *.py

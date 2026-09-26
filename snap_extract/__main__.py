@@ -3,12 +3,14 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import __version__
 from .core import (ALL_COLUMNS, DEFAULT_COLUMNS, default_collection_path, extract_collection,
                    filter_rows, load_catalog, refresh_catalog, render_export, save_export)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Export your Marvel Snap collection locally.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--export", type=Path, help="Save directly to a file instead of opening the app")
     parser.add_argument("--collection", type=Path, help="Override the collection path (also works with the GUI)")
     parser.add_argument("--format", choices=("csv", "tsv", "json", "prompt"), default="csv")
@@ -48,7 +50,7 @@ def main():
         format_name = "AI prompt" if args.format == "prompt" else args.format.upper()
         output = render_export(rows, columns, format_name,
                                catalog, collection, args.request, bool(args.search or args.cost != "Any"))
-        save_export(args.export, output, format_name, source)
+        save_export(args.export, output, format_name, source, overwrite=args.force)
         print(f"Saved {len(rows)} unique cards to {args.export} ({collection.duplicates} duplicate copies removed).")
         if collection.missing:
             print("Warning: UNKNOWN metadata for " + ", ".join(collection.missing), file=sys.stderr)

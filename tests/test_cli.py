@@ -55,3 +55,14 @@ class CliTests(unittest.TestCase):
         before = self.source.read_bytes()
         self.assertEqual(self.run_cli("--export", str(self.source), "--force"), 1)
         self.assertEqual(self.source.read_bytes(), before)
+
+    def test_file_created_during_loading_is_not_overwritten(self):
+        output = self.root / "concurrent.json"
+
+        def render(*args):
+            output.write_text("another process wrote this", encoding="utf-8")
+            return "[]"
+
+        with patch("snap_extract.__main__.render_export", side_effect=render):
+            self.assertEqual(self.run_cli("--export", str(output), "--format", "json"), 1)
+        self.assertEqual(output.read_text(), "another process wrote this")

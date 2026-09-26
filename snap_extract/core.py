@@ -8,11 +8,14 @@ import os
 import tempfile
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
+
+from . import __version__
 
 CATALOG_URL = "https://snap.fan/cards/"
 DEFAULT_COLUMNS = ("name", "cost", "power", "ability")
@@ -39,7 +42,7 @@ def read_json(path: Path):
             time.sleep(0.1)
 
 
-def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
+def atomic_write(path: Path, content: str, encoding: str = "utf-8", *, overwrite: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
     try:
@@ -47,7 +50,12 @@ def atomic_write(path: Path, content: str, encoding: str = "utf-8") -> None:
                                          dir=path.parent, delete=False) as f:
             temp_path = Path(f.name)
             f.write(content)
-        os.replace(temp_path, path)
+        if overwrite:
+            os.replace(temp_path, path)
+        else:
+            # Publish the complete file only if the destination is still absent.
+            # A separate exists() check cannot protect against concurrent writers.
+            os.link(temp_path, path)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -132,10 +140,12 @@ def validate_catalog(payload: dict) -> dict:
     if not isinstance(cards, dict) or len(cards) < 100:
         raise ValueError("The card catalog is incomplete. Refresh card data.")
     for key, card in cards.items():
-        if (not isinstance(card, dict) or card.get("card_id") != key
-                or not isinstance(card.get("name"), str) or not card["name"]
+        if (not isinstance(key, str) or not key.strip()
+                or not isinstance(card, dict) or card.get("card_id") != key
+                or not isinstance(card.get("name"), str) or not card["name"].strip()
                 or type(card.get("cost")) is not int or type(card.get("power")) is not int
-                or not isinstance(card.get("ability"), str) or not card["ability"]):
+                or not isinstance(card.get("ability"), str) or not card["ability"].strip()
+                or any(not isinstance(card.get(field, ""), str) for field in ("series", "keywords", "card_type"))):
             raise ValueError("Invalid card data. Refresh card data to repair the cache.")
     try:
         stamp = datetime.fromisoformat(payload["fetched_at"])
@@ -146,13 +156,25 @@ def validate_catalog(payload: dict) -> dict:
     return payload
 
 
+class CatalogRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep catalog requests on the trusted HTTPS origin, including redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlsplit(newurl)
+        if (target.scheme != "https" or target.hostname != "snap.fan"
+                or target.port not in (None, 443) or target.username is not None or target.password is not None):
+            raise ValueError("The catalog redirected outside https://snap.fan; the existing cache was kept.")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def refresh_catalog(cache_path: Path | None = None) -> dict:
     # The URL and headers never contain account, collection, or owned card data.
     request = urllib.request.Request(CATALOG_URL, headers={
-        "User-Agent": "SnapExtract/1.0 (personal collection CSV exporter)",
+        "User-Agent": f"SnapExtract/{__version__} (personal collection CSV exporter)",
         "Accept": "text/html",
     })
-    with urllib.request.urlopen(request, timeout=25) as response:
+    opener = urllib.request.build_opener(CatalogRedirectHandler())
+    with opener.open(request, timeout=25) as response:
         raw = response.read(8_000_001)
         if len(raw) > 8_000_000:
             raise ValueError("The catalog response is unexpectedly large; the existing cache was kept.")
@@ -171,6 +193,12 @@ def load_catalog(cache_path: Path | None = None) -> dict:
 
 
 @dataclass
+class Deck:
+    name: str
+    rows: list[dict]
+
+
+@dataclass
 class Collection:
     rows: list[dict]
     instances: int
@@ -179,6 +207,46 @@ class Collection:
     missing: list[str] = field(default_factory=list)
     modified: str = ""
     version: str = ""
+    decks: list[Deck] = field(default_factory=list)
+    deck_warnings: list[str] = field(default_factory=list)
+
+
+def card_row(card_id: str, catalog: dict) -> dict:
+    card = catalog["cards"].get(card_id)
+    if card is None:
+        card = {"card_id": card_id, "name": card_id, "cost": None, "power": None,
+                "ability": "UNKNOWN - refresh card data before using this card.",
+                "series": "", "keywords": ""}
+    return {k: card.get(k, "") for k in ALL_COLUMNS}
+
+
+def extract_decks(server: dict, catalog: dict) -> tuple[list[Deck], list[str]]:
+    """Read saved decks, keeping card order and excluding account/cosmetic fields."""
+    items = server.get("Decks", [])
+    if not isinstance(items, list):
+        return [], ["Saved decks could not be read: ServerState.Decks is not a list."]
+    # Some saves contain instance references instead of embedded deck cards.
+    instances = {c["Id"]: c.get("CardDefId") for c in server.get("Cards", [])
+                 if isinstance(c, dict) and isinstance(c.get("Id"), str)}
+    decks, warnings = [], []
+    for index, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            warnings.append(f"Skipped saved deck {index}: invalid deck entry.")
+            continue
+        name = item.get("Name")
+        name = name if isinstance(name, str) and name.strip() else f"Untitled deck {index}"
+        if "Cards" in item:
+            cards = item["Cards"]
+            ids = [c.get("CardDefId") if isinstance(c, dict) else None for c in cards] if isinstance(cards, list) else None
+        else:
+            references = item.get("CardIds")
+            ids = [instances.get(ref) if isinstance(ref, str) else None for ref in references] if isinstance(references, list) else None
+        if ids is None or any(not isinstance(card_id, str) or not card_id.strip() for card_id in ids):
+            # Never silently export a truncated deck or guess a missing card.
+            warnings.append(f"Skipped saved deck {index} ({name}): unreadable card references. Reload after opening SNAP.")
+            continue
+        decks.append(Deck(name, [card_row(card_id, catalog) for card_id in ids]))
+    return decks, warnings
 
 
 def extract_collection(path: Path, catalog: dict) -> Collection:
@@ -198,16 +266,13 @@ def extract_collection(path: Path, catalog: dict) -> Collection:
             ignored += 1
     rows, missing = [], []
     for card_id in counts:
-        card = catalog["cards"].get(card_id)
-        if card is None:
+        if card_id not in catalog["cards"]:
             missing.append(card_id)
-            card = {"card_id": card_id, "name": card_id, "cost": None, "power": None,
-                    "ability": "UNKNOWN - refresh card data before using this card.",
-                    "series": "", "keywords": ""}
-        rows.append({k: card.get(k, "") for k in ALL_COLUMNS})
+        rows.append(card_row(card_id, catalog))
+    decks, deck_warnings = extract_decks(server, catalog)
     return Collection(rows, sum(counts.values()), sum(n - 1 for n in counts.values()), ignored,
                       sorted(missing), datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"),
-                      str(payload.get("ApplicationVersion", "unknown")))
+                      str(payload.get("ApplicationVersion", "unknown")), decks, deck_warnings)
 
 
 def filter_rows(rows: list[dict], query: str = "", cost: str = "Any", sort: str = "Cost, then name") -> list[dict]:
@@ -224,7 +289,8 @@ def filter_rows(rows: list[dict], query: str = "", cost: str = "Any", sort: str 
 
 def safe_cell(value):
     # Preserve real negative numeric power; only escape text formulas for spreadsheet viewers.
-    if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+    if isinstance(value, str) and (value.startswith(("\t", "\r", "\n"))
+                                  or value.lstrip().startswith(("=", "+", "-", "@", "＝", "＋", "－", "＠"))):
         return "'" + value
     return value
 
@@ -243,7 +309,7 @@ def render_export(rows: list[dict], columns=DEFAULT_COLUMNS, format: str = "CSV"
     if format not in ("CSV", "TSV", "AI prompt"):
         raise ValueError("Unknown export format.")
     stream = io.StringIO(newline="")
-    writer = csv.writer(stream, delimiter="\t" if format == "TSV" else ",", lineterminator="\n")
+    writer = csv.writer(stream, delimiter="\t" if format == "TSV" else ",", lineterminator="\n", quoting=csv.QUOTE_ALL)
     writer.writerow(columns)
     for row in rows:
         writer.writerow([safe_cell(row.get(c)) for c in columns])
@@ -265,10 +331,40 @@ def render_export(rows: list[dict], columns=DEFAULT_COLUMNS, format: str = "CSV"
             "<owned_cards_csv>\n" + data + "</owned_cards_csv>\n")
 
 
-def save_export(path: Path, text: str, format: str, source: Path) -> None:
+def render_deck_export(decks: list[Deck], format: str = "Text") -> str:
+    """Export exactly the selected decks, including empty decks and repeated names."""
+    if not decks:
+        raise ValueError("Select at least one deck to export.")
+    if format == "JSON":
+        return json.dumps([{"name": deck.name, "cards": deck.rows} for deck in decks], ensure_ascii=False, indent=2) + "\n"
+    if format in ("CSV", "TSV"):
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream, delimiter="\t" if format == "TSV" else ",", lineterminator="\n", quoting=csv.QUOTE_ALL)
+        writer.writerow(("deck_number", "deck_name", *ALL_COLUMNS))
+        for number, deck in enumerate(decks, 1):
+            for row in deck.rows or [{}]:
+                writer.writerow([number, safe_cell(deck.name), *(safe_cell(row.get(c)) for c in ALL_COLUMNS)])
+        return stream.getvalue()
+    if format != "Text":
+        raise ValueError("Unknown deck export format.")
+    parts = []
+    for number, deck in enumerate(decks, 1):
+        parts.append(f"Deck {number}: {deck.name}\n{len(deck.rows)} cards\n")
+        for row in deck.rows:
+            cost = row["cost"] if row["cost"] is not None else "?"
+            power = row["power"] if row["power"] is not None else "?"
+            parts.append(f"- {row['name']} (cost {cost}, power {power})\n  {row['ability']}\n")
+        if not deck.rows:
+            parts.append("(Empty saved deck)\n")
+        parts.append("\n")
+    return "".join(parts).rstrip() + "\n"
+
+
+def save_export(path: Path, text: str, format: str, source: Path, *, overwrite: bool = True) -> None:
     # Never overwrite the user's input or SNAP state files through the save dialog/CLI.
     target = path.resolve()
     source = source.resolve()
-    if target == source or source.parent == target.parent or source.parent in target.parents:
+    protected = (source.parent, default_collection_path().resolve().parent)
+    if any(target == folder or folder in target.parents for folder in protected):
         raise ValueError("Choose an export folder outside SNAP's state folder.")
-    atomic_write(path, text, encoding="utf-8-sig" if format == "CSV" else "utf-8")
+    atomic_write(path, text, encoding="utf-8-sig" if format == "CSV" else "utf-8", overwrite=overwrite)

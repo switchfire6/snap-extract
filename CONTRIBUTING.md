@@ -12,6 +12,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 .\.venv\Scripts\python.exe -m ruff check snap_extract tests run_app.py tools
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pip_audit -r requirements-dev.txt
 .\.venv\Scripts\python.exe run_app.py
 ```
 
@@ -32,11 +33,20 @@ The tests use synthetic collections and mocked catalog downloads. They must not 
 - `snap_extract/gui.py`: native Tkinter interface and background loading.
 - `snap_extract/__main__.py`: CLI and GUI entry point.
 - `tests/`: offline regression tests.
-- `build.ps1`: isolated Windows executable build and distributable ZIP.
+- `build.ps1`: isolated Windows executable, portable ZIP, and installer build.
+- `installer/`: per-user Inno Setup installer with shortcuts and uninstall support.
+- `assets/`: original app icon; regenerate with `tools/New-AppIcon.ps1`.
 - `tools/`: build support scripts.
 
 ## Releases
 
-Update both `pyproject.toml` and `snap_extract/__init__.py`, document the changes in `CHANGELOG.md`, then run `build.ps1`. The Windows CI build also produces a downloadable artifact. Distribute the ZIP, which includes license notices, rather than just the executable. Publishing a release is a maintainer action; pushes do not automatically create releases.
+1. Update the version in `snap_extract/__init__.py` (the package and Windows version resources use this single value), the download filenames in `README.md`, and `CHANGELOG.md`.
+2. Run lint, offline tests, and `python -m pip_audit -r requirements-dev.txt`.
+3. Run `build.ps1` using current 64-bit Python 3.13+ with Tcl/Tk. The compiler bootstrap verifies a pinned Inno Setup download's checksum and publisher signature. Review the upstream release and checksum when updating that pin.
+4. Run `tools/Test-WindowsDistribution.ps1` in a clean Windows account. This installs, upgrades, launches, and uninstalls the app, including Start menu and desktop shortcuts. It refuses to touch an existing Snap Extract install or shortcut. Use `-PortableOnly` on your normal account if necessary. Test fixtures and logs stay under ignored `build/smoke/`.
+5. Inspect the installer visually and check normal and minimum app window sizes. Confirm that `dist/SHA256SUMS.txt` matches the versioned installer and portable ZIP. If signing binaries, sign the app before packaging and the installer after compilation, then regenerate checksums with `python tools/package_distribution.py --checksums --installer`.
+6. Attach the installer, portable ZIP, and checksums from the same successful build to a GitHub release. Distribute complete bundles with license notices, never the executable alone.
+
+CI performs the same Windows build and installer smoke test and uploads all three release assets. Weekly CI runs check dependency advisories even when source has not changed. Publishing a release is a maintainer action; pushes do not automatically create releases. Current builds are unsigned; do not describe checksums as proof of publisher identity.
 
 By contributing, you agree that your original contribution is provided under the repository's MIT license. Game content and third-party components keep their own licensing terms.

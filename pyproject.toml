@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=78.1.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "snap-extract"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Export a local Marvel Snap card collection for AI deck building."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -33,6 +33,12 @@ snap-extract-gui = "snap_extract.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["snap_extract*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "snap_extract.__version__"}
+
+[tool.setuptools.package-data]
+snap_extract = ["assets/*.ico"]
 
 [tool.ruff]
 target-version = "py310"
